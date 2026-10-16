@@ -1,1 +1,1 @@
-# -CS375-Lab-7-Thread-Safe-DS
+# CS375-Lab-7-Thread-Safe-DS
