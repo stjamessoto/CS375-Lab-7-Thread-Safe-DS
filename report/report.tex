@@ -1,0 +1,452 @@
+\documentclass[11pt]{article}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{float}
+\usepackage{hyperref}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    language=C++,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!50!black},
+    stringstyle=\color{red},
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    showstringspaces=false
+}
+
+% Source code lives in ../src, screenshots in ./screenshots
+\graphicspath{{screenshots/}}
+\newcommand{\src}{../src}
+
+% \screenshot{file}{caption}{label}
+% Shows screenshots/<file> if it exists; otherwise a placeholder box so the
+% report still compiles before the screenshots are added.
+\newcommand{\screenshot}[3]{%
+  \begin{figure}[H]
+    \centering
+    \IfFileExists{screenshots/#1}{%
+      \includegraphics[width=\textwidth,height=0.85\textheight,keepaspectratio]{#1}%
+    }{%
+      \fbox{\parbox[c][4cm][c]{0.9\textwidth}{\centering
+        \textbf{Screenshot missing}\\[4pt]
+        Save it as \texttt{report/screenshots/\detokenize{#1}}}}%
+    }
+    \caption{#2}
+    \label{#3}
+  \end{figure}}
+
+
+\begin{document}
+\sloppy
+
+\title{CS-375 Operating Systems Lab Assignment: Thread-Safe Data Structures}
+\author{Santiago Soto} % <-- replace with your name
+\date{\today}
+\maketitle
+
+\tableofcontents
+\newpage
+
+%=====================================================================
+\section{Introduction}
+This report documents the implementations and analyses for the thread-safe
+data structures lab assignment, covering thread-safe queue and stack
+implementations, Producer-Consumer and Undo-Redo use cases, and additional
+exercises (priority queue, circular buffer, deque and linked list).
+
+All programs were compiled with
+\texttt{g++ -o <name> <name>.cpp -pthread -std=c++11} on Ubuntu Linux.
+Every data structure follows the same principle: the underlying container is
+\emph{private} and every public method acquires the object's
+\texttt{std::mutex} before touching it. Because the only way to reach the data
+is through a locked method, at most one thread can read or modify the
+container at any moment, which removes data races by construction.
+
+All test programs also use a global \texttt{coutMutex} when printing. Without
+it, \texttt{std::cout} calls from different threads can interleave
+character-by-character and produce garbled lines. This lock is for readable
+output only; correctness of the data structures does not depend on it.
+
+%=====================================================================
+\section{Exercise 1: Thread-Safe Queue and Stack}
+\lstinputlisting[language=C++]{\src/thread_safe_data_structures.cpp}
+
+\subsection*{Explanation}
+\textbf{How \texttt{std::lock\_guard} ensures thread safety.}
+\texttt{std::lock\_guard<std::mutex> lock(mtx);} locks the mutex in its
+constructor and unlocks it in its destructor (RAII). The lock therefore covers
+exactly the scope of the method and is released on every exit path, including
+the early \texttt{return false} in \texttt{pop()} and any exception thrown by
+the container. The mutex cannot be left locked by mistake, which would
+deadlock every later caller.
+
+In \texttt{ThreadSafeQueue} and \texttt{ThreadSafeStack}, \texttt{push},
+\texttt{pop}, \texttt{empty} and \texttt{size} all lock the same mutex, so they
+are mutually exclusive. The key design decision is that \texttt{pop()} does the
+\emph{check}, the \emph{read} and the \emph{removal} in one critical section:
+\begin{lstlisting}
+bool pop(T& value) {
+    std::lock_guard<std::mutex> lock(mtx);
+    if (queue.empty()) return false;
+    value = queue.front();
+    queue.pop();
+    return true;
+}
+\end{lstlisting}
+If a caller instead wrote \texttt{if (!q.empty()) \{ v = q.front(); q.pop(); \}}
+using separately locked calls, another thread could empty the queue between
+the check and the read (a \emph{check-then-act} race). Combining the steps
+makes the operation atomic.
+
+\textbf{Producer-Consumer.} Three producers each push 5 messages into a shared
+\texttt{ThreadSafeQueue<std::string>}, and two consumers pop them. The
+counter \texttt{messages\_produced} is a \texttt{std::atomic<int>}, so its
+increments from several producers are never lost.
+
+\textbf{Consumer termination condition.} A consumer loops forever and stops
+only when \texttt{pop()} fails \emph{and} all 15 messages had been produced. A
+failed \texttt{pop()} alone is not enough, because the queue may just be
+temporarily empty while producers are still running. Since each producer
+increments the counter \emph{after} the push, a counter value of 15 means all
+15 messages are already in the queue. The order of the checks matters: the
+consumer reads the counter \emph{before} calling \texttt{pop()}. If it checked
+afterwards, this interleaving would be possible: the pop fails, a producer pushes
+the last message and sets the counter to 15, then the consumer sees 15 and quits
+with one message still in the queue. Reading first guarantees that a failed pop
+really means the queue has been drained. (The original starter
+loop \texttt{while (consumed < 15)} counted per consumer, so with two consumers
+neither one would ever reach 15 by itself. The \texttt{break} was the only real
+exit, and I made that explicit.) The summary line confirms
+\texttt{produced 15, consumed 15, left in queue 0}.
+
+\textbf{Undo-Redo.} \texttt{editText} pushes the current text onto the undo
+stack and clears the redo stack, because a new edit invalidates the redo
+history. \texttt{undo} pops the previous state and pushes the current state onto
+the redo stack. \texttt{redo} does the reverse. The sequence produces:
+Hello $\rightarrow$ Hello World $\rightarrow$ Hello Universe $\rightarrow$
+(undo) Hello World $\rightarrow$ (undo) Hello $\rightarrow$ (redo) Hello World
+$\rightarrow$ Hello Galaxy. A final \texttt{redo} prints ``Nothing to redo'',
+which shows that the edit cleared the redo history.
+
+\subsection*{Analysis}
+Output order varies between runs because the OS scheduler decides which thread
+runs next. That variation is expected. What never varies is that each message
+is consumed \emph{exactly once}, and none are lost or duplicated.
+
+\textbf{If synchronization were removed:} \texttt{std::queue} is not
+thread-safe. Two producers calling \texttt{push} simultaneously could both
+write to the same slot or corrupt the internal \texttt{std::deque} block
+pointers, which can lose messages or crash the program. Two consumers could both
+read the same \texttt{front()} before either calls \texttt{pop()}, so one
+message is processed twice and the next is popped without ever being read. If
+\texttt{messages\_produced} were a plain \texttt{int}, the read-modify-write in
+\texttt{++} could lose increments. The counter might then never reach 15, and
+the consumers would spin forever.
+
+\textbf{Deadlock considerations:} each method holds exactly one lock and never
+calls another locking method while holding it, so no lock-ordering cycle (and
+no deadlock) is possible. In the Undo-Redo system, each stack operation is
+individually atomic. The \emph{combination} of \texttt{undoStack.pop} +
+\texttt{redoStack.push} + updating \texttt{currentText} is not atomic, however.
+That is acceptable here because the demo is single-threaded. With several
+editing threads, one extra mutex around each whole edit/undo/redo would be
+needed to keep the three pieces of state consistent.
+
+\textbf{Observed output (Figure~\ref{fig:ex1}).} The three producers' messages
+interleave in a different order in each round (for example Producer 0, 2, 1 in
+round 1), which shows the scheduler running the threads truly concurrently.
+Consumer 0 processed 8 messages and Consumer 1 processed 7, so the work was
+shared between them, and the summary line \texttt{produced 15, consumed 15,
+left in queue 0} confirms that every message was consumed exactly once. Both
+consumers printed their ``finished'' line, which shows the termination
+condition works. In Problem 2, the stack states follow the expected sequence,
+and the final \texttt{Redo - Nothing to redo} shows that the ``Hello Galaxy''
+edit cleared the redo history (final undo stack size 3, redo stack size 0).
+
+\subsection*{Screenshot}
+\screenshot{Lab7exercise1_screenshot.png}{Compilation and execution of thread\_safe\_data\_structures.cpp}{fig:ex1}
+
+%=====================================================================
+\section{Exercise 3: Thread-Safe Priority Queue}
+\lstinputlisting[language=C++]{\src/priority_queue.cpp}
+
+\subsection*{Explanation}
+\textbf{Maintaining order.} \texttt{std::priority\_queue<int>} is a binary
+max-heap stored in a \texttt{std::vector}. \texttt{push} appends the element
+and sifts it up, and \texttt{pop} moves the last element to the root and sifts
+it down. Both take $O(\log n)$ and preserve the heap invariant (each parent
+$\ge$ its children), so \texttt{top()} is always the largest element.
+
+\textbf{Thread safety.} During a sift the heap is temporarily \emph{invalid}.
+Elements are halfway through being swapped. If another thread read or modified
+the heap at that moment, it could observe or create a broken heap, after which
+\texttt{top()} would no longer be the maximum. Holding the mutex for the whole
+\texttt{push}/\texttt{pop} makes each heap update atomic, so other threads only
+ever see a valid heap. As in Exercise 1, \texttt{pop} combines \texttt{top()}
+and \texttt{pop()} under one lock.
+
+I replaced \texttt{rand()} with a per-thread \texttt{std::mt19937} generator
+because \texttt{rand()} uses hidden global state and is not guaranteed to be
+thread-safe. The popper now loops until it has removed all 20 elements instead
+of making a fixed 20 attempts.
+
+\subsection*{Analysis}
+Four pusher threads push 5 random priorities each (every 100\,ms). One popper
+removes an element every 150\,ms. While pushes are still arriving, the popper
+returns the largest element \emph{currently} in the queue. A larger value
+pushed later can therefore appear after a smaller one was popped earlier, so
+the popped sequence is not globally sorted. Once all pushers finish (about
+0.5\,s), the remaining pops come out in strictly descending order, which
+demonstrates that the heap order is preserved under concurrency. The final line
+confirms all 20 elements were popped and the queue is empty.
+
+Because every operation takes the same lock, pushers and the popper are fully
+serialized on the queue. With heavy contention this lock becomes a bottleneck,
+but each critical section is only $O(\log n)$, so contention here is minimal.
+
+\textbf{Observed output (Figure~\ref{fig:ex3}).} The first pop returned 88,
+but larger values (98, 93, 99) were pushed later. While pushers are still
+running, each pop returns the maximum of what is \emph{currently} in the queue,
+not of everything that will ever be pushed. Once all 20 values were in the
+queue, the popper drained it in strictly descending order (99, 89, 88, 87,
+\ldots, 20, 20, 10), and the duplicate value 20 was handled correctly. The
+\texttt{remaining} counter drops by exactly one per pop down to 0, so no
+element was lost or duplicated.
+
+\subsection*{Screenshot}
+\screenshot{Lab7exercise3.png}{Compilation and execution of priority\_queue.cpp}{fig:ex3}
+
+%=====================================================================
+\section{Exercise 4: Thread-Safe Circular Buffer}
+\lstinputlisting[language=C++]{\src/circular_buffer.cpp}
+
+\subsection*{Explanation}
+The buffer is a fixed array of \texttt{BUFFER\_SIZE = 5} integers with a write
+index \texttt{in}, a read index \texttt{out} and a \texttt{count}. Both indices
+advance with \texttt{(i + 1) \% BUFFER\_SIZE}, so they wrap around and reuse
+slots without any allocation.
+
+\textbf{Condition variables.} Besides mutual exclusion, a bounded buffer needs
+\emph{waiting}: a producer must wait while the buffer is full and a consumer
+must wait while it is empty. Two \texttt{std::condition\_variable}s provide
+this:
+\begin{itemize}
+  \item \texttt{not\_full.wait(lock, [this]\{ return count < BUFFER\_SIZE; \})}
+        atomically releases the mutex and puts the producer to sleep. It
+        re-acquires the lock when woken and returns only once the predicate is
+        true.
+  \item After inserting, the producer calls \texttt{not\_empty.notify\_one()}
+        to wake one sleeping consumer. Consumers do the symmetric thing with
+        \texttt{not\_empty} / \texttt{not\_full}.
+\end{itemize}
+\texttt{std::unique\_lock} is required instead of \texttt{lock\_guard} because
+\texttt{wait()} must unlock and relock the mutex. The predicate form of
+\texttt{wait} re-checks the condition in a loop, which handles
+\emph{spurious wake-ups} and the case where another thread consumed the slot
+first. The lock is released before \texttt{notify\_one()} so the woken thread
+does not immediately block on the mutex again.
+
+\textbf{Change from the starter code.} In the starter code, \texttt{pop()}
+returned \texttt{false} on an empty buffer instead of waiting. The consumer's
+fixed 10-iteration loop could then finish having consumed fewer than 10
+items. Items would be silently left in the buffer, and if more than 5 were
+left the producer would block on \texttt{not\_full} forever (a hang). I made
+\texttt{pop()} wait on \texttt{not\_empty}, as the requirement to use condition
+variables implies, and kept the non-blocking behaviour as a separate
+\texttt{try\_pop()}. The test uses 2 producers and 2 consumers (10 items per
+producer, 10 per consumer), as required.
+
+\subsection*{Analysis}
+Producers run every 50\,ms and consumers every 150\,ms, so the buffer fills to
+5/5 (printed as \texttt{FULL}). Producers then block until a consumer frees a
+slot. This is \emph{back-pressure}: the fast side is throttled to the speed of
+the slow side, and memory use stays bounded. All 20 items are consumed and the
+buffer ends empty.
+
+\textbf{Comparison with \texttt{ThreadSafeQueue} (Exercise 1):}
+\begin{center}
+\begin{tabular}{|p{3.3cm}|p{5.5cm}|p{5.5cm}|}
+\hline
+ & \textbf{ThreadSafeQueue} & \textbf{ThreadSafeCircularBuffer} \\ \hline
+Capacity & Unbounded (grows with \texttt{std::queue}) & Fixed, 5 slots \\ \hline
+Memory & Dynamic allocation on growth & Pre-allocated array, no allocation \\ \hline
+Synchronization & \texttt{mutex} + \texttt{lock\_guard} only & \texttt{mutex} + two condition variables \\ \hline
+Empty pop & Returns \texttt{false} immediately; caller must poll (sleep and retry) & Blocks until data arrives, with no busy-waiting \\ \hline
+Full push & Never full & Blocks until space is free \\ \hline
+CPU use while idle & Polling wastes wake-ups & Sleeping threads use no CPU \\ \hline
+Risk & Unbounded memory if producers outpace consumers & Deadlock if consumers stop while producers wait \\ \hline
+\end{tabular}
+\end{center}
+Without the condition variables, a producer would have to spin while the
+buffer is full, wasting CPU. Without the mutex, two producers could write the
+same \texttt{buffer[in]} slot and both increment \texttt{count}, which loses
+one item and corrupts the count.
+
+\textbf{Observed output (Figure~\ref{fig:ex4}).} From the moment
+\texttt{104} was produced, the buffer repeatedly reaches \texttt{5/5 FULL}.
+After that, every new item appears only right after a consumer frees a slot,
+which is the producers blocking on \texttt{not\_full} as intended. All 20 values
+(100--109 and 200--209) are consumed exactly once, and the run ends with
+\texttt{Buffer empty: yes}.
+
+Some printed occupancies look odd, for example \texttt{Producer 2 produced:
+200 [buffer 0/5]} or \texttt{Consumer 2 consumed: 203 [buffer 5/5]}. This is
+not a bug in the buffer. The program calls \texttt{size()} \emph{after}
+\texttt{push()}/\texttt{pop()} has released the lock, so other threads can run in
+between. In the first case a consumer had already removed item 200; in the
+second a producer had already refilled the slot. Each method is atomic on its
+own, but a \emph{sequence} of calls is not, so any value read after the lock is
+released is only a snapshot. This is exactly the check-then-act issue
+discussed in Exercise 1.
+
+\subsection*{Screenshot}
+\screenshot{Lab7exercise4_screenshot.png}{Compilation and execution of circular\_buffer.cpp}{fig:ex4}
+
+%=====================================================================
+\section{Exercise 5: Thread-Safe Deque}
+\lstinputlisting[language=C++]{\src/thread_safe_deque.cpp}
+
+\subsection*{Explanation}
+\textbf{Challenges of synchronizing both ends.} It is tempting to give the
+front and the back their own locks so a thread at one end does not block a
+thread at the other. The two ends are not independent, however:
+\begin{itemize}
+  \item When the deque holds \textbf{one} element, \texttt{front()} and
+        \texttt{back()} are the \emph{same} element. A concurrent
+        \texttt{pop\_front} and \texttt{pop\_back} could both see it and both
+        remove it. The result is one value returned twice and an underflow of
+        the container.
+  \item When it is \textbf{empty}, a \texttt{push\_front} and a
+        \texttt{pop\_back} race on the same element.
+  \item \texttt{std::deque} keeps shared bookkeeping (block map, size). Either
+        end can reallocate the block map, which invalidates the other end's
+        internal pointers.
+\end{itemize}
+For these reasons the implementation uses \textbf{one mutex for the whole
+deque}. Each operation, including the \texttt{empty()} check plus the
+read and removal in the pops, is a single atomic critical section. Fine-grained
+per-end locking is possible only with a custom structure (for example a doubly
+linked list with sentinel nodes), and it still needs special handling when the
+size is 0 or 1, which adds complexity and room for deadlock if two locks are
+ever taken in different orders.
+
+\subsection*{Analysis}
+Thread 1 pushes to the front, thread 2 pushes to the back, and two threads
+pop from the front and back. Elements from thread 1 accumulate at the front
+(most recent first) and elements from thread 2 at the back, so
+\emph{Popped front} mostly returns 1xx values and \emph{Popped back} mostly
+returns 2xx values. When the deque gets short, either popper can take an
+element pushed from the other end. The final summary checks that
+\texttt{pushed = popped + remaining}, so no element was lost or duplicated.
+Some pop attempts find the deque empty and simply return \texttt{false}.
+
+Without the mutex, the size-0/1 races above would lead to double pops,
+lost elements or a crash. The cost of the single lock is that operations on
+opposite ends cannot run in parallel. For short critical sections like these,
+that cost is negligible compared to the safety gained.
+
+\textbf{Observed output (Figure~\ref{fig:ex5}).} Front pops returned 1xx
+values and back pops returned 2xx values, as expected, since thread 1 only
+pushes at the front and thread 2 only at the back. One line appears out of
+order: \texttt{Popped back: 200} is printed before \texttt{Thread 2 pushed back:
+200}. The push really did happen first (otherwise the pop could not have
+returned 200). The pushing thread released the deque lock and was then
+preempted before it acquired \texttt{coutMutex}, so the popper's message was
+printed first. Print order is therefore not the same as operation order. The
+summary \texttt{pushed 10, popped 10, remaining 0 -> consistent} confirms that
+no element was lost or duplicated.
+
+\subsection*{Screenshot}
+\screenshot{Lab7exercise5_screenshot.png}{Compilation and execution of thread\_safe\_deque.cpp}{fig:ex5}
+
+%=====================================================================
+\section{Exercise 6: Thread-Safe Linked List}
+\lstinputlisting[language=C++]{\src/thread_safe_linked_list.cpp}
+
+\subsection*{Explanation}
+\textbf{Maintaining list integrity.} A singly linked list is defined entirely
+by its \texttt{head} pointer and the \texttt{next} pointers. Each operation
+modifies them in several steps, and the list must never be observed or modified
+between those steps:
+\begin{itemize}
+  \item \textbf{Lost insert:} \texttt{push\_front} reads \texttt{head} into
+        \texttt{newNode->next} and then writes \texttt{head = newNode}. If two
+        threads interleave, both new nodes point to the same old head, and the
+        second write overwrites the first. One node becomes unreachable
+        (lost data and a memory leak).
+  \item \textbf{Double delete:} if two threads run \texttt{pop\_front}
+        simultaneously, both may read the same \texttt{head}, return the same
+        value and \texttt{delete} the same node twice. That is undefined
+        behaviour, typically heap corruption or a crash.
+  \item \textbf{Use after free:} \texttt{size()} walks the list. If a node is
+        deleted while another thread is standing on it, the walker dereferences
+        freed memory.
+\end{itemize}
+The mutex makes every read-modify-write of \texttt{head} atomic, and
+\texttt{size()} holds the lock for the whole traversal. Two small optimizations
+shorten the critical sections without breaking safety. \texttt{new Node} is
+allocated \emph{before} taking the lock because it touches no shared state, and
+\texttt{delete temp} happens \emph{after} releasing the lock because the node
+is already unlinked and no other thread can reach it. I also deleted the copy
+constructor and copy assignment, because a copied list would share and
+double-delete the same nodes. The destructor pops all remaining nodes so no
+memory leaks.
+
+\subsection*{Analysis}
+Two pushers insert 5 nodes each at the head while a popper removes from the
+head. Since this is a LIFO structure, the popper usually gets the most recently
+pushed node. After pushing stops, nodes come out in reverse insertion order.
+The list size printed after each pop decreases consistently.
+
+\textbf{Performance considerations.} This is \emph{coarse-grained} locking:
+one mutex serializes all operations. It is simple and obviously correct.
+\texttt{push\_front}/\texttt{pop\_front} are $O(1)$, but \texttt{size()} is
+$O(n)$ and blocks every other thread for the whole traversal. Possible
+improvements:
+\begin{itemize}
+  \item keep a \texttt{count} member updated under the lock, so \texttt{size()}
+        is $O(1)$;
+  \item \emph{fine-grained (hand-over-hand) locking} with one mutex per node,
+        which lets operations on different parts of the list proceed in
+        parallel. It is more complex, and locks must always be acquired in list
+        order to avoid deadlock;
+  \item a \emph{lock-free} stack using \texttt{std::atomic<Node*>} and
+        compare-and-swap on \texttt{head}. This has no blocking, but it must
+        deal with the ABA problem and safe memory reclamation.
+\end{itemize}
+Since all operations here act only on the head, fine-grained locking would
+gain nothing. A single mutex is the right choice for this workload.
+
+\textbf{Observed output (Figure~\ref{fig:ex6}).} Because
+\texttt{push\_front}/\texttt{pop\_front} form a LIFO stack, each pop returns
+the most recently inserted node (for example 100 right after it was pushed). After
+both pushers finished, the remaining nodes came out in reverse insertion order
+(204, 104, 203, 202, 102, 201, 200). The reported list size decreases by one with
+each pop down to 0, and all 10 nodes were removed exactly once. The list
+was never corrupted (no lost node, no double free, no crash).
+
+\subsection*{Screenshot}
+\screenshot{Lab7exercise6_screenshot.png}{Compilation and execution of thread\_safe\_linked\_list.cpp}{fig:ex6}
+
+%=====================================================================
+\section{Conclusion}
+All five data structures achieve thread safety the same way: private state, one
+mutex per object, and RAII locks (\texttt{std::lock\_guard} /
+\texttt{std::unique\_lock}) that cover each operation entirely, including
+compound \emph{check-then-act} steps such as ``if not empty, read and remove''.
+The circular buffer adds condition variables so threads can \emph{wait} for a
+state change instead of polling. Removing the locks would produce lost updates,
+duplicated or lost elements, corrupted containers, double frees and crashes.
+Keeping each critical section short and never holding two locks at once
+prevents deadlock.
+
+\end{document}

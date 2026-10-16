@@ -1,0 +1,16 @@
+# compiled programs
+bin/
+src/thread_safe_data_structures
+src/priority_queue
+src/circular_buffer
+src/thread_safe_deque
+src/thread_safe_linked_list
+
+# LaTeX build files (report.pdf is kept)
+report/*.aux
+report/*.log
+report/*.fls
+report/*.fdb_latexmk
+report/*.out
+report/*.toc
+report/*.synctex.gz
